@@ -2,10 +2,18 @@
 
 Every dynamic-table virtual address is resolved through the PT_LOAD
 segment map.  Validation runs in a fixed order (ELF header, program
-headers, dynamic segment, string table, symbol/hash tables, version
-tables, cross-table consistency) and the first violation raises
+headers, dynamic segment, string table, symbol/hash tables, hash-table
+vs. symbol-table lookup consistency, version tables, cross-table
+consistency) and the first violation raises
 :class:`~elfaudit.errors.StructuralError`, so callers can always locate
 the first structural error deterministically.
+
+The lookup-consistency stage guarantees that the dynamic lookup
+metadata (SysV ``DT_HASH`` and/or GNU ``DT_GNU_HASH``) agrees with the
+dynamic symbol table: every symbol a table covers must be reachable
+through that table's index path.  An object whose lookup data can no
+longer produce one of its own definitions is rejected, so audit
+verdicts never bind references a real loader could not resolve.
 """
 from __future__ import annotations
 
@@ -121,7 +129,6 @@ class ElfFile:
         self._strtab: tuple[int, int] | None = None
         self._sysv = None  # (nbucket, buckets, chains)
         self._gnu = None   # (nbuckets, symoffset, buckets, chain_vaddr)
-        self._symbol_names: dict[str, list[int]] = {}
         self._find_cache: dict[str, tuple[int, ...]] = {}
 
     # ------------------------------------------------------------------
@@ -134,7 +141,13 @@ class ElfFile:
         return elf
 
     def find(self, name: str) -> list[int]:
-        """Return dynsym indexes of every entry called ``name`` (sorted)."""
+        """Return dynsym indexes of every entry called ``name`` (sorted).
+
+        The lookup walks exactly the index path a dynamic linker would
+        use (SysV bucket chain or GNU bucket/chain); parsing has already
+        proven that path consistent with the symbol table, so the result
+        is precisely the set of symbols the loader can reach.
+        """
         cached = self._find_cache.get(name)
         if cached is not None:
             return list(cached)
@@ -166,8 +179,6 @@ class ElfFile:
                     if cv & 1:
                         break
                     i += 1
-        if not out:
-            out.extend(self._symbol_names.get(name, ()))
         result = tuple(sorted(set(out)))
         self._find_cache[name] = result
         return list(result)
@@ -422,9 +433,14 @@ class ElfFile:
             self.symbols.append(
                 Symbol(i, name, st_name, st_info, st_other, st_shndx, st_value, st_size)
             )
-            if name not in self._symbol_names:
-                self._symbol_names[name] = []
-            self._symbol_names[name].append(i)
+
+        # 6b. lookup metadata must agree with the symbol table ----------
+        # A definition the hash tables can no longer produce must not
+        # participate in binding; reject the whole object instead.
+        if have_sysv:
+            self._check_sysv_consistency()
+        if have_gnu:
+            self._check_gnu_consistency()
 
         # 7. version tables ---------------------------------------------
         have_verdef = DT_VERDEF in tags or DT_VERDEFNUM in tags
@@ -528,6 +544,60 @@ class ElfFile:
                 raise StructuralError("DT_GNU_HASH", "bucket index out of range", off)
         self._gnu = (nbuckets, symoffset, buckets, chain_vaddr)
         return count
+
+    def _check_sysv_consistency(self) -> None:
+        """Every symbol must be reachable through its SysV bucket chain."""
+        nbucket, buckets, chains = self._sysv
+        for i in range(1, len(self.symbols)):
+            name = self.symbols[i].name
+            j = buckets[elf_hash(name.encode("utf-8")) % nbucket]
+            # Bucket starts and chain values were range-checked and proven
+            # acyclic when the table was parsed, so this walk terminates.
+            while j and j != i:
+                j = chains[j]
+            if j != i:
+                raise StructuralError(
+                    "DT_HASH",
+                    f"symbol {i} ('{name}') is not reachable through its "
+                    f"SysV hash bucket",
+                    None,
+                )
+
+    def _check_gnu_consistency(self) -> None:
+        """Every hashed symbol must be reachable through its GNU chain."""
+        nbuckets, symoffset, buckets, chain_vaddr = self._gnu
+        for i in range(symoffset, len(self.symbols)):
+            name = self.symbols[i].name
+            h = gnu_hash(name.encode("utf-8"))
+            start = buckets[h % nbuckets]
+            if start == 0 or start > i:
+                raise StructuralError(
+                    "DT_GNU_HASH",
+                    f"symbol {i} ('{name}') is not reachable through its "
+                    f"GNU hash bucket",
+                    None,
+                )
+            # The bucket's run must stretch from ``start`` to ``i``: any
+            # chain terminator in between cuts the symbol off.
+            for j in range(start, i):
+                off = self._map(chain_vaddr + 4 * (j - symoffset), 4,
+                                "DT_GNU_HASH")
+                if self._u32(off, "DT_GNU_HASH") & 1:
+                    raise StructuralError(
+                        "DT_GNU_HASH",
+                        f"symbol {i} ('{name}') is cut off by an early GNU "
+                        f"hash chain terminator",
+                        None,
+                    )
+            off = self._map(chain_vaddr + 4 * (i - symoffset), 4,
+                            "DT_GNU_HASH")
+            if (self._u32(off, "DT_GNU_HASH") | 1) != (h | 1):
+                raise StructuralError(
+                    "DT_GNU_HASH",
+                    f"symbol {i} ('{name}') has a GNU hash chain value that "
+                    f"does not match its name",
+                    None,
+                )
 
     def _parse_verdef(self, vaddr: int, count: int) -> None:
         if count == 0:

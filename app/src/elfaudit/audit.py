@@ -4,7 +4,8 @@ Given a target ET_DYN object and its named dependency objects, the audit
 
 * rejects the first structural error found while parsing (truncation,
   misalignment, duplicate object names, missing dependencies, unmappable
-  tables, contradictory version references),
+  tables, lookup metadata that disagrees with the symbol table,
+  contradictory version references),
 * computes the breadth-first load order, de-duplicating dependency rings
   by first discovery,
 * binds every undefined global/weak dynamic symbol to the first

@@ -10,7 +10,14 @@ from elfaudit.elf import (
     ElfFile,
     StructuralError,
 )
-from elfbuilder import ElfBuilder, dynamic_value, patch_dynamic, patch_u16
+from elfbuilder import (
+    ElfBuilder,
+    corrupt_gnu_symbol_hash,
+    dynamic_value,
+    orphan_sysv_symbol,
+    patch_dynamic,
+    patch_u16,
+)
 
 
 def good_lib() -> bytes:
@@ -182,6 +189,89 @@ class DynamicTableRules(unittest.TestCase):
         tgt.need("liba.so").need("liba.so")
         tgt.symbol("alpha", defined=False)
         expect_error(self, tgt.build(), "DT_NEEDED", "duplicate")
+
+
+class LookupConsistencyRules(unittest.TestCase):
+    """Hash tables must agree with the symbol table they index."""
+
+    def test_sysv_bucket_orphan_rejected(self):
+        lib = ElfBuilder(soname="liba.so")
+        lib.symbol("alpha")
+        data = orphan_sysv_symbol(lib.build(), "alpha")
+        expect_error(self, data, "DT_HASH", "'alpha'")
+
+    def test_sysv_orphan_reports_first_unreachable_symbol(self):
+        lib = ElfBuilder(soname="liba.so")
+        lib.symbol("alpha").symbol("beta")
+        data = orphan_sysv_symbol(lib.build(), "beta")
+        expect_error(self, data, "DT_HASH", "not reachable")
+
+    def test_sysv_only_orphan_rejected(self):
+        lib = ElfBuilder(soname="liba.so")
+        lib.emit_gnu = False
+        lib.symbol("alpha").symbol("beta")
+        data = orphan_sysv_symbol(lib.build(), "alpha")
+        expect_error(self, data, "DT_HASH", "not reachable")
+
+    def test_gnu_chain_hash_mismatch_rejected(self):
+        lib = ElfBuilder(soname="liba.so")
+        lib.emit_sysv = False
+        lib.symbol("alpha").symbol("beta")
+        data = corrupt_gnu_symbol_hash(lib.build(), 2)
+        expect_error(self, data, "DT_GNU_HASH", "'beta'")
+
+    def test_gnu_bucket_misdirect_rejected(self):
+        # Point the only bucket at the last symbol: every earlier symbol
+        # is cut off from the GNU index path.
+        lib = ElfBuilder(soname="liba.so")
+        lib.emit_sysv = False
+        lib.symbol("alpha").symbol("beta")
+        data = bytearray(lib.build())
+        gnu_v = dynamic_value(bytes(data), DT_GNU_HASH)
+        struct.pack_into("<I", data, gnu_v + 16 + 8, 2)  # bucket[0] = 2
+        expect_error(self, bytes(data), "DT_GNU_HASH", "'alpha'")
+
+    def test_gnu_early_chain_terminator_rejected(self):
+        # Dual tables: the GNU-derived symbol count shrinks below the
+        # SysV nchain and the two tables disagree.
+        lib = ElfBuilder(soname="liba.so")
+        lib.symbol("alpha").symbol("beta")
+        data = bytearray(lib.build())
+        gnu_v = dynamic_value(bytes(data), DT_GNU_HASH)
+        chain_off = gnu_v + 16 + 8 + 4  # header + bloom + one bucket
+        value = struct.unpack_from("<I", data, chain_off)[0]
+        struct.pack_into("<I", data, chain_off, value | 1)
+        expect_error(self, bytes(data), "DT_GNU_HASH", "disagree")
+
+    def test_dual_tables_gnu_side_corruption_located(self):
+        # SysV side stays intact; the GNU side alone disagrees with the
+        # symbol table and must be the reported error.
+        lib = ElfBuilder(soname="liba.so")
+        lib.symbol("alpha").symbol("beta")
+        data = corrupt_gnu_symbol_hash(lib.build(), 2)
+        expect_error(self, data, "DT_GNU_HASH", "'beta'")
+
+    def test_dual_tables_sysv_side_corruption_located(self):
+        lib = ElfBuilder(soname="liba.so")
+        lib.symbol("alpha")
+        data = orphan_sysv_symbol(lib.build(), "alpha")
+        expect_error(self, data, "DT_HASH", "'alpha'")
+
+    def test_unreferenced_symbol_orphan_still_rejected(self):
+        # Nothing outside the object references 'beta'; the corruption is
+        # still a parse-time structural error.
+        lib = ElfBuilder(soname="liba.so")
+        lib.symbol("alpha").symbol("beta")
+        data = corrupt_gnu_symbol_hash(lib.build(), 2)
+        expect_error(self, data, "DT_GNU_HASH", "'beta'")
+
+    def test_healthy_multi_symbol_objects_still_parse(self):
+        for sysv, gnu in ((True, True), (True, False), (False, True)):
+            lib = ElfBuilder(soname="liba.so")
+            lib.emit_sysv, lib.emit_gnu = sysv, gnu
+            lib.symbol("alpha").symbol("beta").symbol("gamma")
+            elf = ElfFile.parse(lib.build(), "liba.so")
+            self.assertEqual(elf.find("gamma"), [3])
 
 
 class VersionRules(unittest.TestCase):

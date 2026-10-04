@@ -361,3 +361,30 @@ def patch_dynamic(data: bytes, tag: int, value: int, occurrence: int = 0) -> byt
 
 def patch_u16(data: bytes, offset: int, value: int) -> bytes:
     return data[:offset] + struct.pack("<H", value) + data[offset + 2:]
+
+
+def orphan_sysv_symbol(data: bytes, name: str) -> bytes:
+    """Zero the SysV bucket ``name`` hashes to.
+
+    The symbol entries themselves stay intact, but every symbol in that
+    bucket becomes unreachable through the DT_HASH index path.
+    """
+    base = dynamic_value(data, DT_HASH)
+    nbucket = struct.unpack_from("<I", data, base)[0]
+    off = base + 8 + 4 * (elf_hash(name.encode("utf-8")) % nbucket)
+    return data[:off] + b"\0\0\0\0" + data[off + 4:]
+
+
+def corrupt_gnu_symbol_hash(data: bytes, symbol_index: int) -> bytes:
+    """Flip a non-terminator bit in one symbol's GNU hash chain value.
+
+    The chain length (and thus the derived symbol count) is unchanged,
+    but the symbol's stored hash no longer matches its name, so the
+    DT_GNU_HASH index path can no longer produce it.
+    """
+    base = dynamic_value(data, DT_GNU_HASH)
+    nbuckets, symoffset, bloom_size = struct.unpack_from("<III", data, base)
+    chain = base + 16 + 8 * bloom_size + 4 * nbuckets
+    off = chain + 4 * (symbol_index - symoffset)
+    value = struct.unpack_from("<I", data, off)[0]
+    return data[:off] + struct.pack("<I", value ^ 0x100) + data[off + 4:]

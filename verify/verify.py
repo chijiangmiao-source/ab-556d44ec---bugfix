@@ -8,7 +8,9 @@ Runs against a healthy ``app`` container (or a locally started server):
 3.  parsing-rule unit tests (interleaved),
 4.  weak-symbol scenario (weak references may stay unbound),
 5.  corrupted dynamic-table scenarios (rejection with first error),
-6.  frozen-verdict replay / conflict semantics.
+6.  corrupted dynamic lookup metadata (SysV/GNU index paths that can no
+    longer reach their own symbols are rejected, never bound),
+7.  frozen-verdict replay / conflict semantics.
 
 Exits 0 when every check passes, 1 otherwise.
 """
@@ -28,7 +30,13 @@ for extra in (os.path.join(REPO, "app", "src"), os.path.join(REPO, "tools")):
     if extra not in sys.path:
         sys.path.insert(0, extra)
 
-from elfbuilder import ElfBuilder, dynamic_value, patch_dynamic  # noqa: E402
+from elfbuilder import (  # noqa: E402
+    ElfBuilder,
+    corrupt_gnu_symbol_hash,
+    dynamic_value,
+    orphan_sysv_symbol,
+    patch_dynamic,
+)
 from elfaudit.elf import DT_SYMTAB, DT_VERSYM  # noqa: E402
 
 APP_URL = os.environ.get("APP_URL", "http://127.0.0.1:8000").rstrip("/")
@@ -137,6 +145,23 @@ def weak_fixtures():
               .symbol("weak_choice", defined=False, bind="WEAK")
               .build())
     return target, [("liba.so", liba)]
+
+
+def lookup_fixtures(sysv: bool = True, gnu: bool = True):
+    """Target strongly references nav_update@FC_2.0; the dependency
+    exports it plus an export nothing references (``spare``)."""
+    b = ElfBuilder(soname="liba.so")
+    b.emit_sysv, b.emit_gnu = sysv, gnu
+    liba = (b.verdef("FC_2.0")
+            .symbol("nav_update", version="FC_2.0", value=0xA000)
+            .symbol("spare", value=0xA200)
+            .build())
+    target = (ElfBuilder(soname="fc_core.so")
+              .need("liba.so")
+              .symbol("nav_update", defined=False, version="FC_2.0",
+                      version_file="liba.so")
+              .build())
+    return target, liba
 
 
 # ----------------------------------------------------------------------
@@ -329,6 +354,72 @@ def step_corrupted_tables() -> None:
           json.dumps(verdict)[:400])
 
 
+def step_corrupted_lookup_tables() -> None:
+    print("== corrupted dynamic lookup metadata ==", flush=True)
+
+    # Healthy objects with each index format (SysV only, GNU only, both)
+    # must bind normally.
+    for label, sysv, gnu in (("sysv-only", True, False),
+                             ("gnu-only", False, True),
+                             ("dual-table", True, True)):
+        target, liba = lookup_fixtures(sysv=sysv, gnu=gnu)
+        status, body = post_audit(f"lookup-ok-{label}", "fc_core.so", target,
+                                  [("liba.so", liba)])
+        verdict = json.loads(body) if status in (200, 201) else {}
+        refs = {r["symbol"]: r for r in verdict.get("references", [])}
+        nav = refs.get("nav_update", {})
+        check(f"healthy {label} dependency binds nav_update",
+              verdict.get("status") == "passed"
+              and nav.get("resolution", {}).get("object") == "liba.so",
+              json.dumps(verdict)[:400])
+
+    def expect_rejection(audit_id: str, liba: bytes, field: str,
+                         needle: str) -> None:
+        target, _ = lookup_fixtures()
+        status, body = post_audit(audit_id, "fc_core.so", target,
+                                  [("liba.so", liba)])
+        verdict = json.loads(body) if status in (200, 201) else {}
+        err = verdict.get("error") or {}
+        ok = (verdict.get("status") == "rejected"
+              and err.get("object") == "liba.so"
+              and err.get("field") == field
+              and needle in err.get("message", "")
+              # no partial binding or success verdict for the request
+              and verdict.get("references") == []
+              and verdict.get("first_unresolved") is None)
+        check(f"{audit_id}: corrupted lookup metadata rejected "
+              f"({field})", ok, json.dumps(verdict)[:400])
+
+    # The incident: the direct dependency still contains a same-named
+    # definition of nav_update, but its SysV lookup data no longer
+    # reaches it.  This must be rejected, not bound.
+    _, liba = lookup_fixtures()
+    expect_rejection("lookup-1", orphan_sysv_symbol(liba, "nav_update"),
+                     "DT_HASH", "nav_update")
+
+    # SysV-only index, same corruption.
+    _, liba = lookup_fixtures(gnu=False)
+    expect_rejection("lookup-2", orphan_sysv_symbol(liba, "nav_update"),
+                     "DT_HASH", "nav_update")
+
+    # GNU-only index, chain value no longer matches the symbol name.
+    _, liba = lookup_fixtures(sysv=False)
+    expect_rejection("lookup-3", corrupt_gnu_symbol_hash(liba, 1),
+                     "DT_GNU_HASH", "nav_update")
+
+    # Both tables present but disagreeing: the GNU side is corrupted
+    # while the SysV side still finds the symbol.
+    _, liba = lookup_fixtures()
+    expect_rejection("lookup-4", corrupt_gnu_symbol_hash(liba, 1),
+                     "DT_GNU_HASH", "nav_update")
+
+    # The corrupted symbol is one nothing references ('spare'); the
+    # object is still rejected at parse time.
+    _, liba = lookup_fixtures()
+    expect_rejection("lookup-5", corrupt_gnu_symbol_hash(liba, 2),
+                     "DT_GNU_HASH", "spare")
+
+
 def step_replay_and_conflict(frozen: dict) -> None:
     print("== frozen verdict replay / conflict ==", flush=True)
     target, deps = shadowing_fixtures()
@@ -370,6 +461,7 @@ def main() -> None:
     step_unit_tests()
     step_weak_symbols()
     step_corrupted_tables()
+    step_corrupted_lookup_tables()
     step_replay_and_conflict(frozen)
     summary_and_exit()
 

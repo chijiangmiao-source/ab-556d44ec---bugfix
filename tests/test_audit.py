@@ -2,7 +2,7 @@
 import unittest
 
 from elfaudit.audit import run_audit
-from elfbuilder import ElfBuilder
+from elfbuilder import ElfBuilder, corrupt_gnu_symbol_hash, orphan_sysv_symbol
 
 
 def lib(name, soname=None, needed=(), symbols=()):
@@ -170,6 +170,67 @@ class Binding(unittest.TestCase):
         self.assertEqual(verdict["status"], "passed")
         (ref,) = refs(verdict, "alpha")
         self.assertEqual(ref["resolution"]["object"], "libb.so")
+
+
+class CorruptedLookupMetadata(unittest.TestCase):
+    """Objects whose lookup tables disagree with their symbol table must
+    be rejected outright: no binding, no success verdict."""
+
+    def target(self):
+        return lib("fc.so", needed=("liba.so",),
+                   symbols=(dict(name="nav_update", defined=False),))
+
+    def test_sysv_orphaned_definition_rejected(self):
+        liba = lib("liba.so", symbols=(dict(name="nav_update"),))
+        broken = orphan_sysv_symbol(liba, "nav_update")
+        verdict = run_audit("fc.so", self.target(), [("liba.so", broken)])
+        self.assertEqual(verdict["status"], "rejected")
+        self.assertEqual(verdict["error"]["object"], "liba.so")
+        self.assertEqual(verdict["error"]["field"], "DT_HASH")
+        self.assertIn("nav_update", verdict["error"]["message"])
+        # No partial binding results are produced for the request.
+        self.assertEqual(verdict["references"], [])
+        self.assertIsNone(verdict["first_unresolved"])
+
+    def test_gnu_orphaned_definition_rejected(self):
+        b = ElfBuilder(soname="liba.so")
+        b.emit_sysv = False
+        b.symbol("nav_update")
+        broken = corrupt_gnu_symbol_hash(b.build(), 1)
+        verdict = run_audit("fc.so", self.target(), [("liba.so", broken)])
+        self.assertEqual(verdict["status"], "rejected")
+        self.assertEqual(verdict["error"]["object"], "liba.so")
+        self.assertEqual(verdict["error"]["field"], "DT_GNU_HASH")
+        self.assertEqual(verdict["references"], [])
+
+    def test_corrupted_target_rejected(self):
+        target = orphan_sysv_symbol(self.target(), "nav_update")
+        liba = lib("liba.so", symbols=(dict(name="nav_update"),))
+        verdict = run_audit("fc.so", target, [("liba.so", liba)])
+        self.assertEqual(verdict["status"], "rejected")
+        self.assertEqual(verdict["error"]["object"], "fc.so")
+        self.assertEqual(verdict["error"]["field"], "DT_HASH")
+
+    def test_unreferenced_orphaned_symbol_rejected(self):
+        # 'spare' is never referenced by the target; corrupting its index
+        # path still invalidates the whole object.
+        liba = lib("liba.so", symbols=(dict(name="nav_update"),
+                                       dict(name="spare")))
+        broken = corrupt_gnu_symbol_hash(liba, 2)
+        verdict = run_audit("fc.so", self.target(), [("liba.so", broken)])
+        self.assertEqual(verdict["status"], "rejected")
+        self.assertEqual(verdict["error"]["field"], "DT_GNU_HASH")
+        self.assertIn("spare", verdict["error"]["message"])
+
+    def test_single_table_objects_bind_normally(self):
+        for sysv, gnu in ((True, False), (False, True)):
+            b = ElfBuilder(soname="liba.so")
+            b.emit_sysv, b.emit_gnu = sysv, gnu
+            b.symbol("nav_update")
+            verdict = run_audit("fc.so", self.target(), [("liba.so", b.build())])
+            self.assertEqual(verdict["status"], "passed")
+            (ref,) = refs(verdict, "nav_update")
+            self.assertEqual(ref["resolution"]["object"], "liba.so")
 
 
 class WeakSymbols(unittest.TestCase):
