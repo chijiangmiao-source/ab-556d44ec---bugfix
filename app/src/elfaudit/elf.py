@@ -119,9 +119,11 @@ class ElfFile:
         self.verneed: dict[int, tuple[str, str]] = {}
         self._loads: list[tuple[int, int, int]] = []
         self._strtab: tuple[int, int] | None = None
-        self._sysv = None  # (nbucket, buckets, chains)
-        self._gnu = None   # (nbuckets, symoffset, buckets, chain_vaddr)
-        self._symbol_names: dict[str, list[int]] = {}
+        self._sysv = None  # (nbucket, buckets, chains, table_off)
+        self._gnu = None   # (nbuckets, symoffset, bloom_shift, bloom,
+        #                   buckets, chain_vaddr, table_off)
+        self._sysv_indexed: set[int] = set()
+        self._gnu_indexed: set[int] = set()
         self._find_cache: dict[str, tuple[int, ...]] = {}
 
     # ------------------------------------------------------------------
@@ -134,27 +136,27 @@ class ElfFile:
         return elf
 
     def find(self, name: str) -> list[int]:
-        """Return dynsym indexes of every entry called ``name`` (sorted)."""
+        """Return dynsym indexes of every visible entry called ``name``.
+
+        Only entries reachable through the object's own dynamic symbol
+        lookup tables (DT_HASH / DT_GNU_HASH) are returned; those tables
+        are exhaustively cross-checked against the dynamic symbol table
+        at parse time, so a result here is reproducible by the loader.
+        """
         cached = self._find_cache.get(name)
         if cached is not None:
             return list(cached)
         out: list[int] = []
         encoded = name.encode("utf-8")
         if self._sysv is not None:
-            nbucket, buckets, chains = self._sysv
+            nbucket, buckets, chains, _off = self._sysv
             i = buckets[elf_hash(encoded) % nbucket]
-            steps = 0
             while i:
-                if i >= len(self.symbols):
-                    break  # already proven impossible at parse time
                 if self.symbols[i].name == name:
                     out.append(i)
                 i = chains[i]
-                steps += 1
-                if steps > len(chains):
-                    break
         elif self._gnu is not None:
-            nbuckets, symoffset, buckets, chain_vaddr = self._gnu
+            nbuckets, symoffset, _shift, _bloom, buckets, chain_vaddr, _off = self._gnu
             h = gnu_hash(encoded)
             i = buckets[h % nbuckets]
             if i >= symoffset:
@@ -166,8 +168,6 @@ class ElfFile:
                     if cv & 1:
                         break
                     i += 1
-        if not out:
-            out.extend(self._symbol_names.get(name, ()))
         result = tuple(sorted(set(out)))
         self._find_cache[name] = result
         return list(result)
@@ -422,9 +422,14 @@ class ElfFile:
             self.symbols.append(
                 Symbol(i, name, st_name, st_info, st_other, st_shndx, st_value, st_size)
             )
-            if name not in self._symbol_names:
-                self._symbol_names[name] = []
-            self._symbol_names[name].append(i)
+
+        # 6b. lookup-table / symbol-table consistency -------------------
+        # Every dynamic lookup table must actually index the dynamic
+        # symbols the loader would look up, and each indexed entry must
+        # be reachable through exactly the bucket its own hash selects.
+        # A corrupted lookup path must never silently fall back to a
+        # linear scan of the symbol table.
+        self._check_hash_tables(symcount)
 
         # 7. version tables ---------------------------------------------
         have_verdef = DT_VERDEF in tags or DT_VERDEFNUM in tags
@@ -463,12 +468,18 @@ class ElfFile:
         nchain = self._u32(off + 4, "DT_HASH")
         if nbucket == 0:
             raise StructuralError("DT_HASH", "hash table has zero buckets", off)
+        if nchain == 0:
+            raise StructuralError("DT_HASH", "hash table has a zero-length chain array",
+                                  off + 4)
         total = 8 + 4 * (nbucket + nchain)
         off = self._map(vaddr, total, "DT_HASH")
         buckets = [self._u32(off + 8 + 4 * i, "DT_HASH") for i in range(nbucket)]
         chains = [
             self._u32(off + 8 + 4 * nbucket + 4 * i, "DT_HASH") for i in range(nchain)
         ]
+        # Structural chain validation (index ranges and termination); the
+        # hash-ownership and symbol-coverage checks run once the dynamic
+        # symbol table has been parsed.
         for start in buckets:
             if start >= nchain and start != 0:
                 raise StructuralError("DT_HASH", "bucket index out of range", off)
@@ -480,7 +491,7 @@ class ElfFile:
                 steps += 1
                 if steps > nchain:
                     raise StructuralError("DT_HASH", "cycle in hash chain", off)
-        self._sysv = (nbucket, buckets, chains)
+        self._sysv = (nbucket, buckets, chains, off)
         return nchain
 
     def _parse_gnu(self, vaddr: int) -> int:
@@ -488,14 +499,26 @@ class ElfFile:
         nbuckets = self._u32(off, "DT_GNU_HASH")
         symoffset = self._u32(off + 4, "DT_GNU_HASH")
         bloom_size = self._u32(off + 8, "DT_GNU_HASH")
+        bloom_shift = self._u32(off + 12, "DT_GNU_HASH")
         if nbuckets == 0:
             raise StructuralError("DT_GNU_HASH", "hash table has zero buckets", off)
+        if symoffset == 0:
+            raise StructuralError(
+                "DT_GNU_HASH", "hash symbol offset must be at least 1", off + 4
+            )
         if bloom_size == 0 or (bloom_size & (bloom_size - 1)):
             raise StructuralError(
                 "DT_GNU_HASH", "bloom filter size is not a power of two", off + 8
             )
+        if bloom_shift > 63:
+            raise StructuralError(
+                "DT_GNU_HASH", "bloom shift is out of range for 64-bit words", off + 12
+            )
         header = 16 + bloom_size * 8 + nbuckets * 4
         off = self._map(vaddr, header, "DT_GNU_HASH")
+        bloom = [
+            self._u64(off + 16 + 8 * i, "DT_GNU_HASH") for i in range(bloom_size)
+        ]
         buckets = [
             self._u32(off + 16 + bloom_size * 8 + 4 * i, "DT_GNU_HASH")
             for i in range(nbuckets)
@@ -526,8 +549,186 @@ class ElfFile:
         for b in buckets:
             if b and (b < symoffset or b >= count):
                 raise StructuralError("DT_GNU_HASH", "bucket index out of range", off)
-        self._gnu = (nbuckets, symoffset, buckets, chain_vaddr)
+        self._gnu = (nbuckets, symoffset, bloom_shift, bloom, buckets,
+                     chain_vaddr, off)
         return count
+
+    # ------------------------------------------------------------------
+    # lookup-table / symbol-table consistency
+    # ------------------------------------------------------------------
+    def _check_hash_tables(self, symcount: int) -> None:
+        """Reject objects whose lookup data does not index dynsym.
+
+        The loader resolves names only through DT_HASH / DT_GNU_HASH,
+        never by scanning the symbol table.  Each present table must
+        reach every lookup-visible symbol via the bucket the symbol's
+        own hash selects, every indexed slot must carry the symbol's
+        hash, and (GNU) the bloom filter may not reject a present
+        symbol.  With both tables present the indexed symbol sets must
+        be identical.  Checks walk structures in symbol-index order so
+        the reported error is always the first inconsistent slot.
+        """
+        if self._sysv is not None:
+            self._sysv_indexed = self._validate_sysv(symcount)
+        if self._gnu is not None:
+            self._gnu_indexed = self._validate_gnu(symcount)
+        if self._sysv is not None and self._gnu is not None:
+            sysv_exports = {i for i in self._sysv_indexed if self._is_exported(i)}
+            gnu_exports = {i for i in self._gnu_indexed if self._is_exported(i)}
+            if sysv_exports != gnu_exports:
+                diff = sysv_exports.symmetric_difference(gnu_exports)
+                first = min(diff)
+                _, _, _, _, _, _, gnu_off = self._gnu
+                raise StructuralError(
+                    "DT_GNU_HASH",
+                    f"SysV and GNU lookup tables index different exported "
+                    f"symbol sets: symbol {first} ('{self.symbols[first].name}') "
+                    f"is missing from one table",
+                    gnu_off,
+                )
+
+    def _is_exported(self, index: int) -> bool:
+        """Whether a loader name lookup could return this dynsym entry."""
+        sym = self.symbols[index]
+        return bool(sym.name) and sym.defined and sym.visible and \
+            sym.bind in (STB_GLOBAL, STB_WEAK)
+
+    def _validate_sysv(self, symcount: int) -> set[int]:
+        nbucket, buckets, chains, off = self._sysv
+        chain_off = off + 8 + 4 * nbucket
+        reached: set[int] = set()
+        owner: dict[int, int] = {}
+        for b, start in enumerate(buckets):
+            i = start
+            while i:
+                if i in owner:
+                    raise StructuralError(
+                        "DT_HASH",
+                        f"symbol {i} is linked from more than one hash chain",
+                        chain_off + 4 * i,
+                    )
+                owner[i] = b
+                reached.add(i)
+                i = chains[i]
+        # Index-order checks: hash bucket ownership for every chained slot.
+        for i in sorted(reached):
+            sym = self.symbols[i]
+            if sym.name:
+                expected = elf_hash(sym.name.encode("utf-8")) % nbucket
+                if owner[i] != expected:
+                    raise StructuralError(
+                        "DT_HASH",
+                        f"symbol {i} ('{sym.name}') is chained from bucket "
+                        f"{owner[i]} but its hash selects bucket {expected}",
+                        chain_off + 4 * i,
+                    )
+        # Every exported dynsym entry must be reachable through the index.
+        for i, sym in enumerate(self.symbols):
+            if i and self._is_exported(i) and i not in reached:
+                raise StructuralError(
+                    "DT_HASH",
+                    f"symbol {i} ('{sym.name}') is present in the dynamic "
+                    f"symbol table but is not reachable through any hash bucket",
+                    chain_off + 4 * i,
+                )
+        return reached
+
+    def _validate_gnu(self, symcount: int) -> set[int]:
+        (nbuckets, symoffset, bloom_shift, bloom, buckets,
+         chain_vaddr, off) = self._gnu
+        bloom_off = off + 16
+        bucket_off = bloom_off + 8 * len(bloom)
+        chain_len = symcount - symoffset
+        if chain_len < 0:
+            raise StructuralError(
+                "DT_GNU_HASH",
+                f"hash symbol offset {symoffset} exceeds symbol count {symcount}",
+                off + 4,
+            )
+        chain_base = chain_vaddr
+        if chain_len:
+            chain_base = self._map(chain_vaddr, 4 * chain_len, "DT_GNU_HASH")
+        words = [
+            self._u32(chain_base + 4 * i, "DT_GNU_HASH")
+            for i in range(chain_len)
+        ]
+
+        # Walk every bucket chain; the chains partition the symbol index
+        # range [symoffset, symcount).
+        owner: dict[int, int] = {}
+        for b, start in enumerate(buckets):
+            i = start
+            if not i:
+                continue
+            while True:
+                if i in owner:
+                    raise StructuralError(
+                        "DT_GNU_HASH",
+                        f"symbol {i} is linked from more than one hash bucket",
+                        bucket_off + 4 * b,
+                    )
+                owner[i] = b
+                if words[i - symoffset] & 1:
+                    break
+                i += 1
+                if i >= symcount:
+                    raise StructuralError(
+                        "DT_GNU_HASH",
+                        f"hash chain of bucket {b} runs past the symbol table",
+                        bucket_off + 4 * b,
+                    )
+
+        # Index-order checks over the contiguous chain array.
+        bloom_mask = len(bloom) - 1
+        for i in range(symoffset, symcount):
+            word_off = chain_base + 4 * (i - symoffset)
+            if i not in owner:
+                raise StructuralError(
+                    "DT_GNU_HASH",
+                    f"symbol {i} ('{self.symbols[i].name}') is not covered by "
+                    f"any hash bucket chain",
+                    word_off,
+                )
+            sym = self.symbols[i]
+            if sym.name:
+                h = gnu_hash(sym.name.encode("utf-8"))
+                word = words[i - symoffset]
+                if (word & ~1) != (h & ~1):
+                    raise StructuralError(
+                        "DT_GNU_HASH",
+                        f"hash word for symbol {i} ('{sym.name}') does not "
+                        f"match its name",
+                        word_off,
+                    )
+                if owner[i] != h % nbuckets:
+                    raise StructuralError(
+                        "DT_GNU_HASH",
+                        f"symbol {i} ('{sym.name}') is chained from bucket "
+                        f"{owner[i]} but its hash selects bucket "
+                        f"{h % nbuckets}",
+                        word_off,
+                    )
+                # The bloom filter may not reject a chained symbol.
+                bloom_word = bloom[(h >> 6) & bloom_mask]
+                if not ((bloom_word >> (h & 63)) & 1
+                        and (bloom_word >> ((h >> bloom_shift) & 63)) & 1):
+                    raise StructuralError(
+                        "DT_GNU_HASH",
+                        f"bloom filter rejects symbol {i} ('{sym.name}')",
+                        bloom_off + 8 * ((h >> 6) & bloom_mask),
+                    )
+
+        # Exported symbols may not live below the hash offset, where the
+        # lookup algorithm never visits.
+        for i, sym in enumerate(self.symbols):
+            if i < symoffset and i and self._is_exported(i):
+                raise StructuralError(
+                    "DT_GNU_HASH",
+                    f"exported symbol {i} ('{sym.name}') precedes the GNU "
+                    f"hash symbol offset {symoffset}",
+                    off + 4,
+                )
+        return set(range(symoffset, symcount))
 
     def _parse_verdef(self, vaddr: int, count: int) -> None:
         if count == 0:

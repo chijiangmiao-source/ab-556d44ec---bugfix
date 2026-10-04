@@ -361,3 +361,83 @@ def patch_dynamic(data: bytes, tag: int, value: int, occurrence: int = 0) -> byt
 
 def patch_u16(data: bytes, offset: int, value: int) -> bytes:
     return data[:offset] + struct.pack("<H", value) + data[offset + 2:]
+
+
+def patch_u32(data: bytes, offset: int, value: int) -> bytes:
+    return data[:offset] + struct.pack("<I", value) + data[offset + 4:]
+
+
+def sysv_hash_layout(data: bytes) -> dict:
+    """Offsets of a SysV DT_HASH table emitted by :class:`ElfBuilder`.
+
+    The builder maps virtual addresses 1:1 to file offsets, so the
+    DT_HASH value is the table's file offset.
+    """
+    off = dynamic_value(data, DT_HASH)
+    nbucket, nchain = struct.unpack_from("<II", data, off)
+    return {
+        "off": off,
+        "nbucket": nbucket,
+        "nchain": nchain,
+        "buckets_off": off + 8,
+        "chains_off": off + 8 + 4 * nbucket,
+    }
+
+
+def gnu_hash_layout(data: bytes) -> dict:
+    """Offsets of a DT_GNU_HASH table emitted by :class:`ElfBuilder`."""
+    off = dynamic_value(data, DT_GNU_HASH)
+    nbuckets, symoffset, bloom_size, bloom_shift = struct.unpack_from(
+        "<IIII", data, off)
+    bloom_off = off + 16
+    buckets_off = bloom_off + 8 * bloom_size
+    chains_off = buckets_off + 4 * nbuckets
+    return {
+        "off": off,
+        "nbuckets": nbuckets,
+        "symoffset": symoffset,
+        "bloom_size": bloom_size,
+        "bloom_shift": bloom_shift,
+        "bloom_off": bloom_off,
+        "buckets_off": buckets_off,
+        "chains_off": chains_off,
+    }
+
+
+def corrupt_sysv_bucket(data: bytes, name: str, value: int = 0) -> bytes:
+    """Overwrite the bucket selected by ``name`` (orphans its chain)."""
+    from elfaudit.elf import elf_hash
+    layout = sysv_hash_layout(data)
+    bucket = elf_hash(name.encode("utf-8")) % layout["nbucket"]
+    return patch_u32(data, layout["buckets_off"] + 4 * bucket, value)
+
+
+def corrupt_sysv_chain_link(data: bytes, symbol_index: int,
+                            value: int = 0) -> bytes:
+    """Overwrite one SysV chain link (splices the following nodes out)."""
+    layout = sysv_hash_layout(data)
+    return patch_u32(data, layout["chains_off"] + 4 * symbol_index, value)
+
+
+def corrupt_gnu_chain_word(data: bytes, symbol_index: int,
+                           word: int) -> bytes:
+    """Overwrite the GNU hash word of one chained symbol."""
+    layout = gnu_hash_layout(data)
+    slot = symbol_index - layout["symoffset"]
+    return patch_u32(data, layout["chains_off"] + 4 * slot, word)
+
+
+def corrupt_gnu_bucket(data: bytes, bucket: int, value: int = 0) -> bytes:
+    """Overwrite one GNU bucket value."""
+    layout = gnu_hash_layout(data)
+    return patch_u32(data, layout["buckets_off"] + 4 * bucket, value)
+
+
+def corrupt_gnu_bloom(data: bytes, word_index: int = 0,
+                      value: int = 0) -> bytes:
+    """Overwrite one GNU bloom filter word."""
+    layout = gnu_hash_layout(data)
+    return data[:layout["bloom_off"] + 8 * word_index] + \
+        struct.pack("<Q", value) + \
+        data[layout["bloom_off"] + 8 * word_index + 8:]
+

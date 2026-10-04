@@ -8,7 +8,9 @@ Runs against a healthy ``app`` container (or a locally started server):
 3.  parsing-rule unit tests (interleaved),
 4.  weak-symbol scenario (weak references may stay unbound),
 5.  corrupted dynamic-table scenarios (rejection with first error),
-6.  frozen-verdict replay / conflict semantics.
+6.  corrupted lookup-index scenarios (SysV/GNU hash tables inconsistent
+    with the dynamic symbol table, referenced and unreferenced symbols),
+7.  frozen-verdict replay / conflict semantics.
 
 Exits 0 when every check passes, 1 otherwise.
 """
@@ -17,6 +19,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import struct
 import subprocess
 import sys
 import time
@@ -28,8 +31,19 @@ for extra in (os.path.join(REPO, "app", "src"), os.path.join(REPO, "tools")):
     if extra not in sys.path:
         sys.path.insert(0, extra)
 
-from elfbuilder import ElfBuilder, dynamic_value, patch_dynamic  # noqa: E402
-from elfaudit.elf import DT_SYMTAB, DT_VERSYM  # noqa: E402
+from elfbuilder import (  # noqa: E402
+    ElfBuilder,
+    corrupt_gnu_bucket,
+    corrupt_gnu_chain_word,
+    corrupt_sysv_bucket,
+    dynamic_value,
+    gnu_hash_layout,
+    patch_dynamic,
+)
+from elfaudit.elf import (  # noqa: E402
+    DT_SYMTAB,
+    DT_VERSYM,
+)
 
 APP_URL = os.environ.get("APP_URL", "http://127.0.0.1:8000").rstrip("/")
 
@@ -137,6 +151,21 @@ def weak_fixtures():
               .symbol("weak_choice", defined=False, bind="WEAK")
               .build())
     return target, [("liba.so", liba)]
+
+
+def lookup_fixtures(style: str, extra: tuple[str, ...] = ()):
+    """Provider/consumer pair for nav_update using one hash table style."""
+    lib = ElfBuilder(soname="libnav.so")
+    lib.emit_sysv = style in ("sysv", "both")
+    lib.emit_gnu = style in ("gnu", "both")
+    lib.symbol("nav_update", value=0x7000)
+    for i, n in enumerate(extra):
+        lib.symbol(n, value=0x8000 + 0x100 * i)
+    tgt = ElfBuilder(soname="fc_lookup.so")
+    tgt.emit_sysv = style in ("sysv", "both")
+    tgt.emit_gnu = style in ("gnu", "both")
+    tgt.need("libnav.so").symbol("nav_update", defined=False)
+    return tgt.build(), [("libnav.so", lib.build())]
 
 
 # ----------------------------------------------------------------------
@@ -329,6 +358,171 @@ def step_corrupted_tables() -> None:
           json.dumps(verdict)[:400])
 
 
+def step_lookup_index_corruption() -> None:
+    print("== corrupted lookup-index scenarios ==", flush=True)
+
+    # Valid objects of each index style must keep binding normally.
+    for style in ("sysv", "gnu", "both"):
+        target, deps = lookup_fixtures(style)
+        status, body = post_audit(f"lookup-ok-{style}", "fc_lookup.so",
+                                  target, deps)
+        verdict = json.loads(body) if status in (200, 201) else {}
+        refs = {r["symbol"]: r for r in verdict.get("references", [])}
+        check(f"valid {style} lookup table passes and binds",
+              status == 201 and verdict.get("status") == "passed"
+              and refs.get("nav_update", {}).get("resolution", {})
+              .get("object") == "libnav.so",
+              f"got {status}: {json.dumps(verdict)[:300]}")
+
+    # Direct dependency keeps a same-named definition but its lookup
+    # index can no longer reach it: each index format must be rejected.
+    target, deps = lookup_fixtures("sysv")
+    broken = corrupt_sysv_bucket(deps[0][1], "nav_update")
+    status, body = post_audit("lookup-sysv-broken", "fc_lookup.so", target,
+                              [("libnav.so", broken)])
+    verdict = json.loads(body) if status in (200, 201) else {}
+    err = verdict.get("error") or {}
+    check("SysV-only broken lookup rejected with same-named definition",
+          status == 201 and verdict.get("status") == "rejected"
+          and err.get("object") == "libnav.so"
+          and err.get("field") == "DT_HASH"
+          and verdict.get("references") == []
+          and verdict.get("load_order") == [],
+          json.dumps(verdict)[:400])
+
+    target, deps = lookup_fixtures("gnu")
+    layout = gnu_hash_layout(deps[0][1])
+    word = struct.unpack_from("<I", deps[0][1], layout["chains_off"])[0]
+    broken = corrupt_gnu_chain_word(
+        deps[0][1], 1, 0x0BADF001)  # force chain-end bit on single-symbol chain
+    status, body = post_audit("lookup-gnu-broken", "fc_lookup.so", target,
+                              [("libnav.so", broken)])
+    verdict = json.loads(body) if status in (200, 201) else {}
+    err = verdict.get("error") or {}
+    check("GNU-only broken chain word rejected at the exact slot",
+          verdict.get("status") == "rejected"
+          and err.get("object") == "libnav.so"
+          and err.get("field") == "DT_GNU_HASH"
+          and "nav_update" in err.get("message", "")
+          and err.get("offset") == layout["chains_off"]
+          and verdict.get("references") == [],
+          json.dumps(verdict)[:400])
+
+    # Both tables present: each table is independently cross-checked.
+    target, deps = lookup_fixtures("both")
+    broken = corrupt_sysv_bucket(deps[0][1], "nav_update")
+    status, body = post_audit("lookup-both-sysv-broken", "fc_lookup.so",
+                              target, [("libnav.so", broken)])
+    verdict = json.loads(body) if status in (200, 201) else {}
+    check("dual tables: corrupted SysV side rejected even though GNU is fine",
+          verdict.get("status") == "rejected"
+          and verdict.get("error", {}).get("field") == "DT_HASH",
+          json.dumps(verdict)[:400])
+
+    target, deps = lookup_fixtures("both")
+    layout = gnu_hash_layout(deps[0][1])
+    word = struct.unpack_from("<I", deps[0][1], layout["chains_off"])[0]
+    broken = corrupt_gnu_chain_word(
+        deps[0][1], 1, 0x0BADF001)  # force chain-end bit on single-symbol chain
+    status, body = post_audit("lookup-both-gnu-broken", "fc_lookup.so",
+                              target, [("libnav.so", broken)])
+    verdict = json.loads(body) if status in (200, 201) else {}
+    check("dual tables: corrupted GNU side rejected even though SysV is fine",
+          verdict.get("status") == "rejected"
+          and verdict.get("error", {}).get("field") == "DT_GNU_HASH",
+          json.dumps(verdict)[:400])
+
+    # Bloom filter that rejects a present symbol.
+    target, deps = lookup_fixtures("gnu")
+    lib = bytearray(deps[0][1])
+    bloff = gnu_hash_layout(deps[0][1])["bloom_off"]
+    lib[bloff:bloff + 8] = b"\0" * 8
+    status, body = post_audit("lookup-gnu-bloom", "fc_lookup.so", target,
+                              [("libnav.so", bytes(lib))])
+    verdict = json.loads(body) if status in (200, 201) else {}
+    check("GNU bloom filter rejecting a present symbol is rejected",
+          verdict.get("status") == "rejected"
+          and verdict.get("error", {}).get("field") == "DT_GNU_HASH"
+          and "bloom" in verdict.get("error", {}).get("message", ""),
+          json.dumps(verdict)[:400])
+
+    # Dual-table disagreement: reroute the GNU bucket so one exported
+    # symbol drops off the GNU chains while SysV still indexes it.
+    target, deps = lookup_fixtures("both", ("idle_teardown",))
+    broken = corrupt_gnu_bucket(deps[0][1], 0, 2)
+    status, body = post_audit("lookup-dual-disagree", "fc_lookup.so",
+                              target, [("libnav.so", broken)])
+    verdict = json.loads(body) if status in (200, 201) else {}
+    check("dual tables disagreeing on indexed symbols are rejected",
+          verdict.get("status") == "rejected"
+          and verdict.get("error", {}).get("field") == "DT_GNU_HASH"
+          and "nav_update" in verdict.get("error", {}).get("message", ""),
+          json.dumps(verdict)[:400])
+
+    # Corruption of an unreferenced symbol: the request only binds
+    # nav_update, yet the object must still be rejected and the error
+    # must stably pinpoint the damaged symbol's slot for every style.
+    for style, corrupt_kw in (
+            ("sysv", {"kind": "sysv_bucket"}),
+            ("gnu", {"kind": "gnu_word"}),
+            ("both", {"kind": "sysv_bucket"})):
+        target, deps = lookup_fixtures(style, ("idle_teardown",))
+        lib = deps[0][1]
+        if corrupt_kw["kind"] == "sysv_bucket":
+            broken = corrupt_sysv_bucket(lib, "idle_teardown")
+            field = "DT_HASH"
+        else:
+            broken = corrupt_gnu_chain_word(lib, 2, 0xCCCCCCCD)
+            field = "DT_GNU_HASH"
+        payloads = []
+        errors = []
+        for n in ("lookup-unref-1", "lookup-unref-2"):
+            status, body = post_audit(f"{n}-{style}", "fc_lookup.so", target,
+                                      [("libnav.so", broken)])
+            verdict = json.loads(body) if status in (200, 201) else {}
+            payloads.append(verdict)
+            errors.append(verdict.get("error") or {})
+        same = (errors[0] == errors[1]
+                and all(e.get("field") == field for e in errors))
+        check(f"{style}: unreferenced corrupted symbol stably located ({field})",
+              all(v.get("status") == "rejected" for v in payloads)
+              and same
+              and all(v.get("references") == [] for v in payloads)
+              and "idle_teardown" in errors[0].get("message", ""),
+              json.dumps(payloads[0])[:400])
+
+    # Corruption in the target object itself is rejected, not in a dep.
+    target, deps = lookup_fixtures("gnu")
+    layout = gnu_hash_layout(target)
+    word = struct.unpack_from("<I", target, layout["chains_off"])[0]
+    broken_target = corrupt_gnu_chain_word(
+        target, 1, 0x0BADF001)  # force chain-end bit on single-symbol chain
+    status, body = post_audit("lookup-target-broken", "fc_lookup.so",
+                              broken_target, deps)
+    verdict = json.loads(body) if status in (200, 201) else {}
+    check("corrupted lookup index in the target object is rejected",
+          verdict.get("status") == "rejected"
+          and verdict.get("error", {}).get("object") == "fc_lookup.so"
+          and verdict.get("error", {}).get("field") == "DT_GNU_HASH",
+          json.dumps(verdict)[:400])
+
+    # When two symbols are damaged the first one (lowest index) is the
+    # located structural error, deterministically.
+    target, deps = lookup_fixtures("gnu", ("idle_teardown",))
+    broken = corrupt_gnu_chain_word(deps[0][1], 1, 0xAAAAAAAA)  # even: chain continues
+    broken = corrupt_gnu_chain_word(broken, 2, 0xBBBBBBBF)      # odd: chain ends
+    status, body = post_audit("lookup-first-error", "fc_lookup.so", target,
+                              [("libnav.so", broken)])
+    verdict = json.loads(body) if status in (200, 201) else {}
+    check("first structural error is the lowest damaged slot",
+          verdict.get("status") == "rejected"
+          and "symbol 1" in verdict.get("error", {}).get("message", "")
+          and "nav_update" in verdict.get("error", {}).get("message", "")
+          and verdict.get("error", {}).get("offset")
+          == gnu_hash_layout(deps[0][1])["chains_off"],
+          json.dumps(verdict)[:400])
+
+
 def step_replay_and_conflict(frozen: dict) -> None:
     print("== frozen verdict replay / conflict ==", flush=True)
     target, deps = shadowing_fixtures()
@@ -370,6 +564,7 @@ def main() -> None:
     step_unit_tests()
     step_weak_symbols()
     step_corrupted_tables()
+    step_lookup_index_corruption()
     step_replay_and_conflict(frozen)
     summary_and_exit()
 
